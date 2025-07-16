@@ -50,6 +50,17 @@
 
 (define-map product-certifications {product-id: uint, cert-id: uint} bool)
 
+(define-map producer-reputation uint {
+    total-products: uint,
+    verified-stages: uint,
+    total-stages: uint,
+    on-time-deliveries: uint,
+    late-deliveries: uint,
+    quality-score: uint,
+    reputation-score: uint,
+    last-updated: uint
+})
+
 (define-public (register-producer (name (string-ascii 50)) (location (string-ascii 100)) (wallet principal))
     (let ((producer-id (var-get next-producer-id)))
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -61,6 +72,16 @@
             wallet: wallet,
             certified: false,
             registration-block: stacks-block-height
+        })
+        (map-set producer-reputation producer-id {
+            total-products: u0,
+            verified-stages: u0,
+            total-stages: u0,
+            on-time-deliveries: u0,
+            late-deliveries: u0,
+            quality-score: u100,
+            reputation-score: u100,
+            last-updated: stacks-block-height
         })
         (var-set next-producer-id (+ producer-id u1))
         (ok producer-id)
@@ -112,6 +133,7 @@
             notes: "Product created at farm",
             verified: true
         })
+        (try! (update-producer-products-count producer-id))
         (var-set next-product-id (+ product-id u1))
         (ok product-id)
     )
@@ -151,6 +173,7 @@
         })
         (map-set products product-id 
             (merge product {current-stage: next-stage, current-holder: tx-sender}))
+        (try! (update-producer-stage-count (get producer-id product)))
         (ok next-stage)
     )
 )
@@ -160,6 +183,8 @@
         (asserts! (default-to false (map-get? authorized-handlers tx-sender)) err-unauthorized)
         (map-set supply-chain-stages {product-id: product-id, stage: stage}
             (merge stage-data {verified: true}))
+        (let ((product (unwrap! (map-get? products product-id) err-not-found)))
+            (try! (update-producer-verified-count (get producer-id product))))
         (ok true)
     )
 )
@@ -229,6 +254,108 @@
             stage-3: (map-get? supply-chain-stages {product-id: product-id, stage: u3}),
             stage-4: (map-get? supply-chain-stages {product-id: product-id, stage: u4})
         })
+        none
+    )
+)
+
+(define-private (update-producer-products-count (producer-id uint))
+    (let ((current-rep (default-to {
+            total-products: u0,
+            verified-stages: u0,
+            total-stages: u0,
+            on-time-deliveries: u0,
+            late-deliveries: u0,
+            quality-score: u100,
+            reputation-score: u100,
+            last-updated: stacks-block-height
+        } (map-get? producer-reputation producer-id))))
+        (map-set producer-reputation producer-id 
+            (merge current-rep {
+                total-products: (+ (get total-products current-rep) u1),
+                last-updated: stacks-block-height
+            }))
+        (calculate-reputation-score producer-id)
+    )
+)
+
+(define-private (update-producer-stage-count (producer-id uint))
+    (let ((current-rep (unwrap! (map-get? producer-reputation producer-id) err-not-found)))
+        (map-set producer-reputation producer-id 
+            (merge current-rep {
+                total-stages: (+ (get total-stages current-rep) u1),
+                last-updated: stacks-block-height
+            }))
+        (calculate-reputation-score producer-id)
+    )
+)
+
+(define-private (update-producer-verified-count (producer-id uint))
+    (let ((current-rep (unwrap! (map-get? producer-reputation producer-id) err-not-found)))
+        (map-set producer-reputation producer-id 
+            (merge current-rep {
+                verified-stages: (+ (get verified-stages current-rep) u1),
+                last-updated: stacks-block-height
+            }))
+        (calculate-reputation-score producer-id)
+    )
+)
+
+(define-private (calculate-reputation-score (producer-id uint))
+    (let ((rep (unwrap! (map-get? producer-reputation producer-id) err-not-found))
+          (verification-rate (if (> (get total-stages rep) u0)
+                                (/ (* (get verified-stages rep) u100) (get total-stages rep))
+                                u100))
+          (delivery-rate (if (> (+ (get on-time-deliveries rep) (get late-deliveries rep)) u0)
+                            (/ (* (get on-time-deliveries rep) u100) 
+                               (+ (get on-time-deliveries rep) (get late-deliveries rep)))
+                            u100))
+          (weighted-score (/ (+ (* verification-rate u40) 
+                               (* delivery-rate u30) 
+                               (* (get quality-score rep) u30)) u100)))
+        (map-set producer-reputation producer-id 
+            (merge rep {reputation-score: weighted-score}))
+        (ok weighted-score)
+    )
+)
+
+(define-public (update-delivery-status (producer-id uint) (on-time bool))
+    (let ((current-rep (unwrap! (map-get? producer-reputation producer-id) err-not-found)))
+        (asserts! (default-to false (map-get? authorized-handlers tx-sender)) err-unauthorized)
+        (if on-time
+            (map-set producer-reputation producer-id 
+                (merge current-rep {
+                    on-time-deliveries: (+ (get on-time-deliveries current-rep) u1),
+                    last-updated: stacks-block-height
+                }))
+            (map-set producer-reputation producer-id 
+                (merge current-rep {
+                    late-deliveries: (+ (get late-deliveries current-rep) u1),
+                    last-updated: stacks-block-height
+                })))
+        (calculate-reputation-score producer-id)
+    )
+)
+
+(define-public (update-quality-score (producer-id uint) (quality-score uint))
+    (let ((current-rep (unwrap! (map-get? producer-reputation producer-id) err-not-found)))
+        (asserts! (default-to false (map-get? authorized-handlers tx-sender)) err-unauthorized)
+        (asserts! (<= quality-score u100) err-invalid-input)
+        (map-set producer-reputation producer-id 
+            (merge current-rep {
+                quality-score: quality-score,
+                last-updated: stacks-block-height
+            }))
+        (calculate-reputation-score producer-id)
+    )
+)
+
+(define-read-only (get-producer-reputation (producer-id uint))
+    (map-get? producer-reputation producer-id)
+)
+
+(define-read-only (get-reputation-score (producer-id uint))
+    (match (map-get? producer-reputation producer-id)
+        rep (some (get reputation-score rep))
         none
     )
 )
