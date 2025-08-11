@@ -5,10 +5,13 @@
 (define-constant err-invalid-stage (err u103))
 (define-constant err-already-exists (err u104))
 (define-constant err-invalid-input (err u105))
+(define-constant err-insufficient-funds (err u106))
+(define-constant err-no-premium-available (err u107))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-producer-id uint u1)
 (define-data-var next-certification-id uint u1)
+(define-data-var total-premium-pool uint u0)
 
 (define-map producers uint {
     name: (string-ascii 50),
@@ -49,6 +52,14 @@
 (define-map authorized-handlers principal bool)
 
 (define-map product-certifications {product-id: uint, cert-id: uint} bool)
+
+(define-map premium-distributions {producer-id: uint, period: uint} {
+    total-earned: uint,
+    base-premium: uint,
+    reputation-bonus: uint,
+    distributed-block: uint,
+    period-products: uint
+})
 
 (define-map producer-reputation uint {
     total-products: uint,
@@ -134,6 +145,7 @@
             verified: true
         })
         (try! (update-producer-products-count producer-id))
+        (var-set total-premium-pool (+ (var-get total-premium-pool) fair-trade-premium))
         (var-set next-product-id (+ product-id u1))
         (ok product-id)
     )
@@ -357,6 +369,106 @@
     (match (map-get? producer-reputation producer-id)
         rep (some (get reputation-score rep))
         none
+    )
+)
+
+(define-public (distribute-premium (producer-id uint) (period uint))
+    (let ((producer (unwrap! (map-get? producers producer-id) err-not-found))
+          (reputation (unwrap! (map-get? producer-reputation producer-id) err-not-found))
+          (reputation-score (get reputation-score reputation))
+          (total-products (get total-products reputation))
+          (existing-distribution (map-get? premium-distributions {producer-id: producer-id, period: period})))
+        (asserts! (default-to false (map-get? authorized-handlers tx-sender)) err-unauthorized)
+        (asserts! (is-none existing-distribution) err-already-exists)
+        (asserts! (> total-products u0) err-no-premium-available)
+        (let ((period-products (calculate-period-products producer-id period))
+              (base-premium-per-product u1000)
+              (base-premium (* period-products base-premium-per-product))
+              (reputation-multiplier (/ reputation-score u100))
+              (reputation-bonus (if (> reputation-score u80)
+                                   (/ (* base-premium (- reputation-score u80)) u100)
+                                   u0))
+              (total-distribution (+ base-premium reputation-bonus)))
+            (asserts! (> (var-get total-premium-pool) total-distribution) err-insufficient-funds)
+            (map-set premium-distributions {producer-id: producer-id, period: period} {
+                total-earned: total-distribution,
+                base-premium: base-premium,
+                reputation-bonus: reputation-bonus,
+                distributed-block: stacks-block-height,
+                period-products: period-products
+            })
+            (var-set total-premium-pool (- (var-get total-premium-pool) total-distribution))
+            (try! (stx-transfer? total-distribution tx-sender (get wallet producer)))
+            (ok total-distribution)
+        )
+    )
+)
+
+(define-public (fund-premium-pool (amount uint))
+    (begin
+        (asserts! (> amount u0) err-invalid-input)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set total-premium-pool (+ (var-get total-premium-pool) amount))
+        (ok (var-get total-premium-pool))
+    )
+)
+
+(define-private (calculate-period-products (producer-id uint) (period uint))
+    (let ((target-block-start (* period u1000))
+          (target-block-end (* (+ period u1) u1000))
+          (result (fold count-products-in-period 
+                        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+                        {producer-id: producer-id, period-start: target-block-start, period-end: target-block-end, count: u0})))
+        (get count result)
+    )
+)
+
+(define-private (count-products-in-period (product-index uint) (context {producer-id: uint, period-start: uint, period-end: uint, count: uint}))
+    (let ((product-id product-index))
+        (match (map-get? products product-id)
+            product (if (and (is-eq (get producer-id product) (get producer-id context))
+                           (>= (get created-block product) (get period-start context))
+                           (< (get created-block product) (get period-end context)))
+                       (merge context {count: (+ (get count context) u1)})
+                       context)
+            context
+        )
+    )
+)
+
+(define-read-only (get-premium-distribution (producer-id uint) (period uint))
+    (map-get? premium-distributions {producer-id: producer-id, period: period})
+)
+
+(define-read-only (get-total-premium-pool)
+    (var-get total-premium-pool)
+)
+
+(define-read-only (calculate-projected-premium (producer-id uint) (period uint))
+    (let ((reputation (default-to {
+            total-products: u0,
+            verified-stages: u0,
+            total-stages: u0,
+            on-time-deliveries: u0,
+            late-deliveries: u0,
+            quality-score: u100,
+            reputation-score: u100,
+            last-updated: stacks-block-height
+        } (map-get? producer-reputation producer-id)))
+          (reputation-score (get reputation-score reputation))
+          (period-products (calculate-period-products producer-id period))
+          (base-premium-per-product u1000)
+          (base-premium (* period-products base-premium-per-product))
+          (reputation-bonus (if (> reputation-score u80)
+                               (/ (* base-premium (- reputation-score u80)) u100)
+                               u0)))
+        (some {
+            projected-total: (+ base-premium reputation-bonus),
+            base-amount: base-premium,
+            reputation-bonus: reputation-bonus,
+            period-products: period-products,
+            current-reputation-score: reputation-score
+        })
     )
 )
 
