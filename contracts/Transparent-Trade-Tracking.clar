@@ -7,11 +7,16 @@
 (define-constant err-invalid-input (err u105))
 (define-constant err-insufficient-funds (err u106))
 (define-constant err-no-premium-available (err u107))
+(define-constant err-dispute-exists (err u108))
+(define-constant err-dispute-resolved (err u109))
+(define-constant err-invalid-evidence (err u110))
+(define-constant err-cannot-vote-own-dispute (err u111))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-producer-id uint u1)
 (define-data-var next-certification-id uint u1)
 (define-data-var total-premium-pool uint u0)
+(define-data-var next-dispute-id uint u1)
 
 (define-map producers uint {
     name: (string-ascii 50),
@@ -71,6 +76,29 @@
     reputation-score: uint,
     last-updated: uint
 })
+
+(define-map quality-disputes uint {
+    product-id: uint,
+    stage: uint,
+    complainant: principal,
+    dispute-type: (string-ascii 20),
+    evidence-hash: (string-ascii 64),
+    description: (string-ascii 200),
+    status: uint,
+    created-block: uint,
+    resolution-block: uint,
+    validator-votes: uint,
+    total-votes: uint,
+    stake-amount: uint
+})
+
+(define-map dispute-votes {dispute-id: uint, voter: principal} {
+    vote: bool,
+    stake: uint,
+    voting-block: uint
+})
+
+(define-map dispute-validators {dispute-id: uint, validator: principal} bool)
 
 (define-public (register-producer (name (string-ascii 50)) (location (string-ascii 100)) (wallet principal))
     (let ((producer-id (var-get next-producer-id)))
@@ -470,6 +498,161 @@
             current-reputation-score: reputation-score
         })
     )
+)
+
+(define-public (raise-quality-dispute (product-id uint) (stage uint) (dispute-type (string-ascii 20)) (evidence-hash (string-ascii 64)) (description (string-ascii 200)) (stake-amount uint))
+    (let ((dispute-id (var-get next-dispute-id))
+          (product (unwrap! (map-get? products product-id) err-not-found))
+          (stage-data (unwrap! (map-get? supply-chain-stages {product-id: product-id, stage: stage}) err-not-found)))
+        (asserts! (> (len dispute-type) u0) err-invalid-input)
+        (asserts! (> (len evidence-hash) u0) err-invalid-evidence)
+        (asserts! (> (len description) u0) err-invalid-input)
+        (asserts! (> stake-amount u0) err-invalid-input)
+        (asserts! (is-none (get-active-dispute-for-stage product-id stage)) err-dispute-exists)
+        (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+        (map-set quality-disputes dispute-id {
+            product-id: product-id,
+            stage: stage,
+            complainant: tx-sender,
+            dispute-type: dispute-type,
+            evidence-hash: evidence-hash,
+            description: description,
+            status: u0,
+            created-block: stacks-block-height,
+            resolution-block: u0,
+            validator-votes: u0,
+            total-votes: u0,
+            stake-amount: stake-amount
+        })
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (support-complainant bool) (validator-stake uint))
+    (let ((dispute (unwrap! (map-get? quality-disputes dispute-id) err-not-found)))
+        (asserts! (is-eq (get status dispute) u0) err-dispute-resolved)
+        (asserts! (not (is-eq tx-sender (get complainant dispute))) err-cannot-vote-own-dispute)
+        (asserts! (default-to false (map-get? authorized-handlers tx-sender)) err-unauthorized)
+        (asserts! (is-none (map-get? dispute-votes {dispute-id: dispute-id, voter: tx-sender})) err-already-exists)
+        (asserts! (> validator-stake u0) err-invalid-input)
+        (try! (stx-transfer? validator-stake tx-sender (as-contract tx-sender)))
+        (map-set dispute-votes {dispute-id: dispute-id, voter: tx-sender} {
+            vote: support-complainant,
+            stake: validator-stake,
+            voting-block: stacks-block-height
+        })
+        (map-set dispute-validators {dispute-id: dispute-id, validator: tx-sender} true)
+        (let ((updated-dispute (merge dispute {
+            validator-votes: (if support-complainant (+ (get validator-votes dispute) u1) (get validator-votes dispute)),
+            total-votes: (+ (get total-votes dispute) u1)
+        })))
+            (map-set quality-disputes dispute-id updated-dispute)
+            (if (>= (get total-votes updated-dispute) u3)
+                (auto-resolve-dispute dispute-id)
+                (ok true))
+        )
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let ((dispute (unwrap! (map-get? quality-disputes dispute-id) err-not-found)))
+        (asserts! (default-to false (map-get? authorized-handlers tx-sender)) err-unauthorized)
+        (asserts! (is-eq (get status dispute) u0) err-dispute-resolved)
+        (asserts! (>= (get total-votes dispute) u3) err-invalid-input)
+        (auto-resolve-dispute dispute-id)
+    )
+)
+
+(define-private (auto-resolve-dispute (dispute-id uint))
+    (let ((dispute (unwrap! (map-get? quality-disputes dispute-id) err-not-found))
+          (majority-threshold (/ (get total-votes dispute) u2))
+          (complainant-supported (> (get validator-votes dispute) majority-threshold))
+          (resolution-status (if complainant-supported u1 u2)))
+        (map-set quality-disputes dispute-id 
+            (merge dispute {
+                status: resolution-status,
+                resolution-block: stacks-block-height
+            }))
+        (if complainant-supported
+            (begin
+                (try! (stx-transfer? (get stake-amount dispute) (as-contract tx-sender) (get complainant dispute)))
+                (try! (penalize-stage-handler dispute-id))
+                (ok true))
+            (begin
+                (ok true))
+        )
+    )
+)
+
+(define-private (penalize-stage-handler (dispute-id uint))
+    (let ((dispute (unwrap! (map-get? quality-disputes dispute-id) err-not-found))
+          (product-id (get product-id dispute))
+          (stage (get stage dispute))
+          (stage-data (unwrap! (map-get? supply-chain-stages {product-id: product-id, stage: stage}) err-not-found))
+          (handler (get handler stage-data)))
+        (map-set supply-chain-stages {product-id: product-id, stage: stage}
+            (merge stage-data {verified: false}))
+        (let ((product (unwrap! (map-get? products product-id) err-not-found))
+              (producer-id (get producer-id product)))
+            (update-producer-quality-penalty producer-id))
+    )
+)
+
+(define-private (update-producer-quality-penalty (producer-id uint))
+    (let ((current-rep (unwrap! (map-get? producer-reputation producer-id) err-not-found))
+          (penalty-amount u5)
+          (new-quality-score (if (> (get quality-score current-rep) penalty-amount)
+                               (- (get quality-score current-rep) penalty-amount)
+                               u0)))
+        (map-set producer-reputation producer-id 
+            (merge current-rep {
+                quality-score: new-quality-score,
+                last-updated: stacks-block-height
+            }))
+        (calculate-reputation-score producer-id)
+    )
+)
+
+(define-private (get-active-dispute-for-stage (product-id uint) (stage uint))
+    (let ((dispute-check (fold check-active-disputes
+                             (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+                             {target-product: product-id, target-stage: stage, found-active: none})))
+        (get found-active dispute-check)
+    )
+)
+
+(define-private (check-active-disputes (dispute-id uint) (context {target-product: uint, target-stage: uint, found-active: (optional uint)}))
+    (if (is-some (get found-active context))
+        context
+        (match (map-get? quality-disputes dispute-id)
+            dispute (if (and (is-eq (get product-id dispute) (get target-product context))
+                           (is-eq (get stage dispute) (get target-stage context))
+                           (is-eq (get status dispute) u0))
+                       (merge context {found-active: (some dispute-id)})
+                       context)
+            context
+        )
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? quality-disputes dispute-id)
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+    (map-get? dispute-votes {dispute-id: dispute-id, voter: voter})
+)
+
+(define-read-only (get-dispute-status (dispute-id uint))
+    (match (map-get? quality-disputes dispute-id)
+        dispute (some (get status dispute))
+        none
+    )
+)
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id)
 )
 
 
