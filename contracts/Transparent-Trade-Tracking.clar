@@ -17,6 +17,8 @@
 (define-data-var next-certification-id uint u1)
 (define-data-var total-premium-pool uint u0)
 (define-data-var next-dispute-id uint u1)
+(define-data-var next-consumer-id uint u1)
+(define-data-var next-purchase-id uint u1)
 
 (define-map producers uint {
     name: (string-ascii 50),
@@ -99,6 +101,34 @@
 })
 
 (define-map dispute-validators {dispute-id: uint, validator: principal} bool)
+
+(define-map consumers principal {
+    consumer-id: uint,
+    total-purchases: uint,
+    total-reward-points: uint,
+    redeemed-points: uint,
+    available-points: uint,
+    registration-block: uint,
+    last-purchase-block: uint
+})
+
+(define-map consumer-purchases uint {
+    consumer: principal,
+    product-id: uint,
+    producer-id: uint,
+    purchase-amount: uint,
+    reward-points-earned: uint,
+    purchase-block: uint,
+    producer-reputation-at-time: uint
+})
+
+(define-map reward-redemptions uint {
+    consumer: principal,
+    points-redeemed: uint,
+    redemption-value: uint,
+    redemption-block: uint,
+    redemption-type: (string-ascii 30)
+})
 
 (define-public (register-producer (name (string-ascii 50)) (location (string-ascii 100)) (wallet principal))
     (let ((producer-id (var-get next-producer-id)))
@@ -653,6 +683,130 @@
 
 (define-read-only (get-next-dispute-id)
     (var-get next-dispute-id)
+)
+
+(define-public (register-consumer)
+    (let ((existing-consumer (map-get? consumers tx-sender)))
+        (asserts! (is-none existing-consumer) err-already-exists)
+        (let ((consumer-id (var-get next-consumer-id)))
+            (map-set consumers tx-sender {
+                consumer-id: consumer-id,
+                total-purchases: u0,
+                total-reward-points: u0,
+                redeemed-points: u0,
+                available-points: u0,
+                registration-block: stacks-block-height,
+                last-purchase-block: u0
+            })
+            (var-set next-consumer-id (+ consumer-id u1))
+            (ok consumer-id)
+        )
+    )
+)
+
+(define-public (record-consumer-purchase (product-id uint) (purchase-amount uint))
+    (let ((product (unwrap! (map-get? products product-id) err-not-found))
+          (producer-id (get producer-id product))
+          (producer-rep (unwrap! (map-get? producer-reputation producer-id) err-not-found))
+          (consumer-data (unwrap! (map-get? consumers tx-sender) err-not-found))
+          (purchase-id (var-get next-purchase-id)))
+        (asserts! (> purchase-amount u0) err-invalid-input)
+        (let ((base-points (/ purchase-amount u100))
+              (reputation-multiplier (get reputation-score producer-rep))
+              (bonus-points (/ (* base-points reputation-multiplier) u100))
+              (total-points (+ base-points bonus-points)))
+            (map-set consumer-purchases purchase-id {
+                consumer: tx-sender,
+                product-id: product-id,
+                producer-id: producer-id,
+                purchase-amount: purchase-amount,
+                reward-points-earned: total-points,
+                purchase-block: stacks-block-height,
+                producer-reputation-at-time: reputation-multiplier
+            })
+            (map-set consumers tx-sender 
+                (merge consumer-data {
+                    total-purchases: (+ (get total-purchases consumer-data) u1),
+                    total-reward-points: (+ (get total-reward-points consumer-data) total-points),
+                    available-points: (+ (get available-points consumer-data) total-points),
+                    last-purchase-block: stacks-block-height
+                }))
+            (var-set next-purchase-id (+ purchase-id u1))
+            (ok {purchase-id: purchase-id, points-earned: total-points})
+        )
+    )
+)
+
+(define-public (redeem-reward-points (points-to-redeem uint) (redemption-type (string-ascii 30)))
+    (let ((consumer-data (unwrap! (map-get? consumers tx-sender) err-not-found)))
+        (asserts! (> points-to-redeem u0) err-invalid-input)
+        (asserts! (>= (get available-points consumer-data) points-to-redeem) err-insufficient-funds)
+        (asserts! (> (len redemption-type) u0) err-invalid-input)
+        (let ((redemption-id (var-get next-purchase-id))
+              (redemption-value (/ (* points-to-redeem u10) u1)))
+            (map-set reward-redemptions redemption-id {
+                consumer: tx-sender,
+                points-redeemed: points-to-redeem,
+                redemption-value: redemption-value,
+                redemption-block: stacks-block-height,
+                redemption-type: redemption-type
+            })
+            (map-set consumers tx-sender 
+                (merge consumer-data {
+                    redeemed-points: (+ (get redeemed-points consumer-data) points-to-redeem),
+                    available-points: (- (get available-points consumer-data) points-to-redeem)
+                }))
+            (try! (stx-transfer? redemption-value (as-contract tx-sender) tx-sender))
+            (ok redemption-value)
+        )
+    )
+)
+
+(define-read-only (get-consumer-profile (consumer principal))
+    (map-get? consumers consumer)
+)
+
+(define-read-only (get-consumer-purchase (purchase-id uint))
+    (map-get? consumer-purchases purchase-id)
+)
+
+(define-read-only (get-reward-redemption (redemption-id uint))
+    (map-get? reward-redemptions redemption-id)
+)
+
+(define-read-only (get-consumer-available-points (consumer principal))
+    (match (map-get? consumers consumer)
+        consumer-data (some (get available-points consumer-data))
+        none
+    )
+)
+
+(define-read-only (calculate-potential-rewards (product-id uint) (purchase-amount uint))
+    (match (map-get? products product-id)
+        product (let ((producer-id (get producer-id product)))
+            (match (map-get? producer-reputation producer-id)
+                producer-rep (let ((base-points (/ purchase-amount u100))
+                                  (reputation-multiplier (get reputation-score producer-rep))
+                                  (bonus-points (/ (* base-points reputation-multiplier) u100))
+                                  (total-points (+ base-points bonus-points)))
+                    (some {
+                        base-points: base-points,
+                        bonus-points: bonus-points,
+                        total-points: total-points,
+                        producer-reputation: reputation-multiplier
+                    }))
+                none
+            ))
+        none
+    )
+)
+
+(define-read-only (get-next-consumer-id)
+    (var-get next-consumer-id)
+)
+
+(define-read-only (get-next-purchase-id)
+    (var-get next-purchase-id)
 )
 
 
