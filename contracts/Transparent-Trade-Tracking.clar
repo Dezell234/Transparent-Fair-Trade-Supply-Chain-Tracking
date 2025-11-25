@@ -11,6 +11,7 @@
 (define-constant err-dispute-resolved (err u109))
 (define-constant err-invalid-evidence (err u110))
 (define-constant err-cannot-vote-own-dispute (err u111))
+(define-constant err-product-recalled (err u112))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-producer-id uint u1)
@@ -130,6 +131,28 @@
     redemption-type: (string-ascii 30)
 })
 
+(define-map product-recalls uint {
+    reason: (string-ascii 200),
+    recalled-block: uint,
+    recalled-by: principal
+})
+
+(define-map batch-recalls {producer-id: uint, batch-id: (string-ascii 50)} {
+    reason: (string-ascii 200),
+    recalled-block: uint,
+    recalled-by: principal
+})
+
+(define-read-only (is-product-recalled (product-id uint))
+    (match (map-get? products product-id)
+        product (or 
+            (is-some (map-get? product-recalls product-id))
+            (is-some (map-get? batch-recalls {producer-id: (get producer-id product), batch-id: (get batch-id product)}))
+        )
+        false
+    )
+)
+
 (define-public (register-producer (name (string-ascii 50)) (location (string-ascii 100)) (wallet principal))
     (let ((producer-id (var-get next-producer-id)))
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -231,6 +254,7 @@
           (next-stage (+ current-stage u1)))
         (asserts! (or (is-eq tx-sender (get current-holder product))
                      (default-to false (map-get? authorized-handlers tx-sender))) err-unauthorized)
+        (asserts! (not (is-product-recalled product-id)) err-product-recalled)
         (asserts! (> (len stage-name) u0) err-invalid-input)
         (asserts! (> (len location) u0) err-invalid-input)
         (map-set supply-chain-stages {product-id: product-id, stage: next-stage} {
@@ -272,6 +296,7 @@
 (define-public (transfer-custody (product-id uint) (new-holder principal))
     (let ((product (unwrap! (map-get? products product-id) err-not-found)))
         (asserts! (is-eq tx-sender (get current-holder product)) err-unauthorized)
+        (asserts! (not (is-product-recalled product-id)) err-product-recalled)
         (map-set products product-id 
             (merge product {current-holder: new-holder}))
         (ok true)
@@ -759,6 +784,34 @@
             (try! (stx-transfer? redemption-value (as-contract tx-sender) tx-sender))
             (ok redemption-value)
         )
+    )
+)
+
+(define-public (recall-product (product-id uint) (reason (string-ascii 200)))
+    (let ((product (unwrap! (map-get? products product-id) err-not-found))
+          (producer (unwrap! (map-get? producers (get producer-id product)) err-not-found)))
+        (asserts! (is-eq tx-sender (get wallet producer)) err-unauthorized)
+        (asserts! (> (len reason) u0) err-invalid-input)
+        (map-set product-recalls product-id {
+            reason: reason,
+            recalled-block: stacks-block-height,
+            recalled-by: tx-sender
+        })
+        (ok true)
+    )
+)
+
+(define-public (recall-batch (producer-id uint) (batch-id (string-ascii 50)) (reason (string-ascii 200)))
+    (let ((producer (unwrap! (map-get? producers producer-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get wallet producer)) err-unauthorized)
+        (asserts! (> (len batch-id) u0) err-invalid-input)
+        (asserts! (> (len reason) u0) err-invalid-input)
+        (map-set batch-recalls {producer-id: producer-id, batch-id: batch-id} {
+            reason: reason,
+            recalled-block: stacks-block-height,
+            recalled-by: tx-sender
+        })
+        (ok true)
     )
 )
 
